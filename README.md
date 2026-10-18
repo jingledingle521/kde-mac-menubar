@@ -40,9 +40,13 @@ commands are typed as keystrokes).
   exporting menus otherwise) and serves apps' menus to the widget as JSON
   over D-Bus (`org.brhett.VivaldiMenu`, `/MenuProxy`).
 - `bridge/extension/` plus `bridge/install-vivaldi.sh` add Vivaldi: the
-  extension carries out menu commands, and Vivaldi is launched through
-  XWayland so the global menu can see its windows. `hide-menu-button.css`
-  is an optional Vivaldi CSS mod that hides its own menu button.
+  extension carries out menu commands, and the widget recognises Vivaldi's
+  window by its app id, so Vivaldi runs natively on Wayland (with real
+  touchpad momentum). The launcher also turns off Vivaldi's laggy smooth
+  scrolling. (Only the stock Global Menu widget would need Vivaldi on
+  XWayland: `install-vivaldi.sh --x11` sets that up, and the helper then
+  tags Vivaldi's X11 windows for it.) `hide-menu-button.css` is an optional
+  Vivaldi CSS mod that hides its own menu button.
 
 ## Uninstall
 

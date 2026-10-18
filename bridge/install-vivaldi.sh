@@ -2,9 +2,15 @@
 # Mac-style File/Edit/View/History/Bookmarks/Window/Help for Vivaldi in KDE's
 # global menu: the helper publishes the menu and attaches it to Vivaldi's
 # windows, and the Mac Menu Bridge extension carries out the commands.
-# Vivaldi has to run through XWayland for the global menu to see it, so this
-# also installs a launcher override with --ozone-platform=x11.
+# The Menu Bar widget finds Vivaldi by its app id, so Vivaldi runs natively on
+# Wayland (with real touchpad momentum). The launcher override adds
+# --ozone-platform=wayland and turns off Vivaldi's smooth-scrolling animation.
+# With --x11 Vivaldi runs through XWayland instead, which the stock Global
+# Menu widget needs (the helper tags its X11 windows with the menu).
 set -euo pipefail
+
+platform=wayland
+[ "${1:-}" = --x11 ] && platform=x11
 
 here=$(cd "$(dirname "$0")" && pwd)
 data=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -20,11 +26,11 @@ mkdir -p "$HOME/.local/bin" "$config/systemd/user" "$data/applications"
 install -m 755 "$here/vivaldi-menu-bridge" "$HOME/.local/bin/vivaldi-menu-bridge"
 cp "$here/vivaldi-menu-bridge.service" "$config/systemd/user/"
 
-# Launcher override: same entry, plus --ozone-platform=x11 on every Exec line.
+# Launcher override: same entry, plus the platform and no smooth scrolling on every Exec line.
 for src in /var/lib/snapd/desktop/applications/vivaldi_vivaldi-stable.desktop \
            /usr/share/applications/vivaldi-stable.desktop; do
     if [ -f "$src" ]; then
-        sed -E 's#^(Exec=[^ ]+( '"'"'--class=[^'"'"']*'"'"')?)#\1 --ozone-platform=x11#' "$src" \
+        sed -E 's#^(Exec=[^ ]+( '"'"'--class=[^'"'"']*'"'"')?)#\1 --ozone-platform='"$platform"' --disable-smooth-scrolling#' "$src" \
             > "$data/applications/$(basename "$src")"
     fi
 done
@@ -54,6 +60,6 @@ Installed. Two one-time steps:
  1. In Vivaldi open vivaldi://extensions, turn on "Developer mode",
     click "Load unpacked" and choose:
       $ext
- 2. Quit Vivaldi completely and start it again, so it runs through
-    XWayland. The menus then appear in the top bar's Global Menu.
+ 2. Quit Vivaldi completely and start it again. Its menus then appear in
+    the Menu Bar widget.
 MSG
