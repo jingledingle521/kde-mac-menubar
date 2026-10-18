@@ -384,7 +384,7 @@ MENUS = [
         {'section': 'Recently Visited'},
         {'dynamic': 'history'},
         SEP,
-        item('Show All History', keys='ctrl+h'),
+        item('Show All History', 'openUrl', 'ctrl+h', {'url': 'vivaldi://history'}),
     ]),
     ('Bookmarks', [
         item('Bookmark This Page…', keys='ctrl+d'),
@@ -488,6 +488,11 @@ class GlobalMenu:
         self.revision = 1
         self.nodes = {0: {'props': {'children-display': 'submenu'}, 'children': []}}
         self.next_id = 1
+        # Stable ids: History and Bookmarks are rebuilt whenever they refresh,
+        # but a menu that is already open still holds the old ids. The same
+        # item (same parent, position and label) keeps its id across rebuilds,
+        # so clicking it still works.
+        self.stable_ids = {}
         self.cache = {name: None for name in DYNAMIC}
         self.top = {}  # top-level menu id -> its MENUS entries
         for title, entries in MENUS:
@@ -497,8 +502,12 @@ class GlobalMenu:
 
     # -- tree building --
     def add(self, parent, props, action=None):
-        nid = self.next_id
-        self.next_id += 1
+        key = (parent, len(self.nodes[parent]['children']), props.get('label'), props.get('type'))
+        nid = self.stable_ids.get(key)
+        if nid is None or nid in self.nodes:
+            nid = self.next_id
+            self.next_id += 1
+            self.stable_ids[key] = nid
         self.nodes[nid] = {'props': props, 'children': [], 'action': action}
         self.nodes[parent]['children'].append(nid)
         return nid
@@ -872,6 +881,9 @@ class MenuProxy:
 
     def local_layout(self, nid):
         menu = self.bridge.menu
+        if nid not in menu.nodes:
+            # A menu that was open across a rebuild asked for an item that is gone.
+            return (nid, {}, [])
         props = dict(menu.nodes[nid]['props'])
         return (nid, props, [self.local_layout(c) for c in menu.nodes[nid]['children']])
 
