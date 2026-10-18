@@ -153,11 +153,18 @@ PlasmoidItem {
         const valid = idx && idx.valid;
         const role = r => valid ? (tasks.data(idx, r) || "") : "";
         const name = valid ? (role(TaskManager.AbstractTasksModel.AppName) || tasks.data(idx, Qt.DisplayRole) || "") : "";
-        const service = role(TaskManager.AbstractTasksModel.ApplicationMenuServiceName);
-        const path = role(TaskManager.AbstractTasksModel.ApplicationMenuObjectPath);
+        let service = role(TaskManager.AbstractTasksModel.ApplicationMenuServiceName);
+        let path = role(TaskManager.AbstractTasksModel.ApplicationMenuObjectPath);
+        const appId = role(TaskManager.AbstractTasksModel.AppId);
+        // Native-Wayland Vivaldi can't be tagged with a menu address (only X11
+        // windows can), so recognise it by its app id and use the helper's menu.
+        if (!service && /vivaldi/i.test(appId)) {
+            service = proxyService;
+            path = "/MenuBar";
+        }
         const appChanged = service !== menuService || path !== menuPath;
         activeName = name;
-        activeAppId = role(TaskManager.AbstractTasksModel.AppId);
+        activeAppId = appId;
         menuService = service;
         menuPath = path;
         if (appChanged) {
