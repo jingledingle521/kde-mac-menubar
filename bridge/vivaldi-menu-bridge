@@ -1,0 +1,1159 @@
+#!/usr/bin/python3 -I
+"""Bridge between the Mac Menu Bridge browser extension and KDE's global menu.
+
+Publishes Vivaldi-style menus as com.canonical.dbusmenu at /MenuBar and marks
+Vivaldi's X11 windows with that address, so the stock Global Menu widget
+shows them (Vivaldi must run via XWayland). Clicks become commands for the
+extension, or keyboard shortcuts when it isn't connected.
+
+The extension connects to ws://127.0.0.1:PORT and proves itself with a shared
+token (~/.config/vivaldi-menu-bridge/config.json). The Plasma widget talks to
+this process over D-Bus:
+
+    org.brhett.VivaldiMenu  /org/brhett/VivaldiMenu
+      Command(s name, s argsJson)      run a browser command (or "keys")
+      Query(s what) -> s json          history, bookmarks, tabs, recentlyClosed
+      Connected() -> b                 whether the extension is connected
+
+"keys" commands are typed with ydotool for things extensions can't do
+(clipboard, find, print, developer tools).
+"""
+import base64
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import socket
+import struct
+import subprocess
+import threading
+import sys
+import time
+
+import gi
+
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib  # noqa: E402
+
+CONFIG_DIR = os.path.join(os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config')), 'vivaldi-menu-bridge')
+CONFIG = os.path.join(CONFIG_DIR, 'config.json')
+BUS_NAME = 'org.brhett.VivaldiMenu'
+OBJECT_PATH = '/org/brhett/VivaldiMenu'
+INTROSPECTION = '''
+<node>
+  <interface name="org.brhett.VivaldiMenu">
+    <method name="Command"><arg type="s" name="name" direction="in"/><arg type="s" name="args" direction="in"/></method>
+    <method name="Query"><arg type="s" name="what" direction="in"/><arg type="s" name="json" direction="out"/></method>
+    <method name="Connected"><arg type="b" name="connected" direction="out"/></method>
+  </interface>
+</node>'''
+QUERY_TIMEOUT = 2.0
+WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+
+def load_config():
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    try:
+        with open(CONFIG) as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, ValueError):
+        cfg = {}
+    changed = False
+    if not cfg.get('token'):
+        cfg['token'] = secrets.token_urlsafe(32)
+        changed = True
+    if not cfg.get('port'):
+        cfg['port'] = 47823
+        changed = True
+    if changed:
+        fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(cfg, f, indent=2)
+    return cfg
+
+
+# ---- Keystrokes ------------------------------------------------------------
+# Linux input event codes (linux/input-event-codes.h).
+KEYCODES = {
+    'ctrl': 29, 'shift': 42, 'alt': 56, 'meta': 125, 'esc': 1, 'tab': 15, 'enter': 28, 'space': 57,
+    'backspace': 14, 'delete': 111, 'left': 105, 'right': 106, 'up': 103, 'down': 108,
+    'pageup': 104, 'pagedown': 109, 'home': 102, 'end': 107, 'minus': 12, 'equal': 13, 'plus': 13,
+    'comma': 51, 'period': 52, 'slash': 53,
+}
+KEYCODES.update({f'f{i}': c for i, c in zip(range(1, 11), range(59, 69))})
+KEYCODES.update({'f11': 87, 'f12': 88})
+KEYCODES.update(dict(zip('1234567890', range(2, 12))))
+KEYCODES.update(dict(zip('qwertyuiop', range(16, 26))))
+KEYCODES.update(dict(zip('asdfghjkl', range(30, 39))))
+KEYCODES.update(dict(zip('zxcvbnm', range(44, 51))))
+
+
+def press(combo):
+    """Type a combination like "ctrl+shift+t" into the focused window."""
+    try:
+        codes = [KEYCODES[k] for k in combo.lower().split('+')]
+    except KeyError:
+        return
+    events = [f'{c}:1' for c in codes] + [f'{c}:0' for c in reversed(codes)]
+    env = dict(os.environ)
+    sock = f'/run/user/{os.getuid()}/.ydotool_socket'
+    if 'YDOTOOL_SOCKET' not in env and os.path.exists(sock):
+        env['YDOTOOL_SOCKET'] = sock
+    # Give the menu time to close so the browser has focus again.
+    time.sleep(0.15)
+    subprocess.run(['ydotool', 'key', *events], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---- WebSocket server (just enough of RFC 6455 for one local client) -------
+class Client:
+    def __init__(self, conn):
+        self.conn = conn
+        self.lock = threading.Lock()
+
+    def send(self, obj):
+        data = json.dumps(obj).encode()
+        header = bytearray([0x81])
+        if len(data) < 126:
+            header.append(len(data))
+        elif len(data) < 65536:
+            header.append(126)
+            header += struct.pack('>H', len(data))
+        else:
+            header.append(127)
+            header += struct.pack('>Q', len(data))
+        with self.lock:
+            self.conn.sendall(bytes(header) + data)
+
+    def recv_exact(self, n):
+        buf = b''
+        while len(buf) < n:
+            chunk = self.conn.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError
+            buf += chunk
+        return buf
+
+    def recv(self):
+        """Next text message, or None on close. Handles pings and fragments."""
+        message = b''
+        while True:
+            b0, b1 = self.recv_exact(2)
+            opcode, length = b0 & 0x0F, b1 & 0x7F
+            if length == 126:
+                length = struct.unpack('>H', self.recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack('>Q', self.recv_exact(8))[0]
+            if length > 8 * 1024 * 1024:
+                raise ConnectionError('frame too large')
+            mask = self.recv_exact(4) if b1 & 0x80 else None
+            payload = self.recv_exact(length)
+            if mask:
+                payload = bytes(p ^ mask[i % 4] for i, p in enumerate(payload))
+            if opcode == 0x8:
+                return None
+            if opcode == 0x9:  # ping
+                with self.lock:
+                    self.conn.sendall(bytes([0x8A, len(payload)]) + payload)
+                continue
+            if opcode in (0x1, 0x0):
+                message += payload
+                if b0 & 0x80:
+                    return message.decode()
+
+
+# ---- Global menu (com.canonical.dbusmenu) ------------------------------------
+# The structure mirrors Vivaldi's own menus. Items run an extension command
+# (cmd) when it's connected, otherwise type their shortcut (keys).
+def item(label, cmd=None, keys=None, args=None, check=None, hidden=False):
+    """A menu item. `check` names a Vivaldi setting shown as a checkmark;
+    `hidden` keys are internal bindings (see VIVALDI_BINDINGS), not shown."""
+    return {'label': label, 'cmd': cmd, 'keys': keys, 'args': args, 'check': check, 'hidden': hidden}
+
+
+# Vivaldi UI commands that have no default shortcut and can't be reached from
+# an extension. `--bind-vivaldi` writes these otherwise-unused shortcuts into
+# Vivaldi's settings so the menu can press them.
+VIVALDI_BINDINGS = {
+    'COMMAND_MAIN_TOGGLE_TAB_BAR': 'ctrl+alt+shift+f1',
+    'COMMAND_MAIN_TOGGLE_ADDRESS_BAR': 'ctrl+alt+shift+f2',
+    'COMMAND_CUSTOMIZE_TOOLBAR': 'ctrl+alt+shift+f3',
+    'COMMAND_SET_LOAD_IMAGES_ALWAYS': 'ctrl+alt+shift+f5',
+    'COMMAND_SET_LOAD_IMAGES_CACHE': 'ctrl+alt+shift+f6',
+    'COMMAND_SET_LOAD_IMAGES_NEVER': 'ctrl+alt+shift+f7',
+    'COMMAND_ADD_TO_WEB_PANEL': 'ctrl+alt+shift+f8',
+    'COMMAND_SHOW_BOOKMARK_PANEL': 'ctrl+alt+shift+1',
+    'COMMAND_SHOW_READING_LIST_PANEL': 'ctrl+alt+shift+2',
+    'COMMAND_SHOW_DOWNLOADS_PANEL': 'ctrl+alt+shift+3',
+    'COMMAND_SHOW_HISTORY_PANEL': 'ctrl+alt+shift+4',
+    'COMMAND_SHOW_NOTES_PANEL': 'ctrl+alt+shift+5',
+    'COMMAND_SHOW_WINDOW_PANEL': 'ctrl+alt+shift+6',
+    'COMMAND_SHOW_TRANSLATE_PANEL': 'ctrl+alt+shift+7',
+    'COMMAND_SHOW_MAIL_PANEL': 'ctrl+alt+shift+8',
+    'COMMAND_SHOW_CALENDAR_PANEL': 'ctrl+alt+shift+9',
+    'COMMAND_SHOW_TASKS_PANEL': 'ctrl+alt+shift+0',
+    'COMMAND_SHOW_FEEDS_PANEL': 'ctrl+alt+shift+f9',
+    'COMMAND_SHOW_CONTACTS_PANEL': 'ctrl+alt+shift+f10',
+    'COMMAND_SHOW_SESSION_PANEL': 'ctrl+alt+shift+f11',
+}
+WEB_PANEL_KEYS = ['z', 'x', 'c', 'v', 'b', 'n', 'm', 'j', 'k']  # letters: same name for Vivaldi and ydotool
+for i, key in enumerate(WEB_PANEL_KEYS, start=1):
+    VIVALDI_BINDINGS[f'COMMAND_SHOW_WEB_PANEL_{i}'] = f'ctrl+alt+shift+{key}'
+
+
+def binding(command):
+    return VIVALDI_BINDINGS[command]
+
+
+PANELS = [('Bookmarks', 'COMMAND_SHOW_BOOKMARK_PANEL'), ('Reading List', 'COMMAND_SHOW_READING_LIST_PANEL'),
+          ('Downloads', 'COMMAND_SHOW_DOWNLOADS_PANEL'), ('History', 'COMMAND_SHOW_HISTORY_PANEL'),
+          ('Notes', 'COMMAND_SHOW_NOTES_PANEL'), ('Window', 'COMMAND_SHOW_WINDOW_PANEL'),
+          ('Translate', 'COMMAND_SHOW_TRANSLATE_PANEL'), ('Mail', 'COMMAND_SHOW_MAIL_PANEL'),
+          ('Calendar', 'COMMAND_SHOW_CALENDAR_PANEL'), ('Tasks', 'COMMAND_SHOW_TASKS_PANEL'),
+          ('Feeds', 'COMMAND_SHOW_FEEDS_PANEL'), ('Contacts', 'COMMAND_SHOW_CONTACTS_PANEL'),
+          ('Sessions', 'COMMAND_SHOW_SESSION_PANEL')]
+
+
+def vivaldi_prefs_path():
+    for path in ('~/snap/vivaldi/current/.config/vivaldi/Default/Preferences', '~/.config/vivaldi/Default/Preferences'):
+        path = os.path.expanduser(path)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+_prefs_cache = {'mtime': None, 'data': {}}
+
+
+def vivaldi_prefs():
+    """Vivaldi's settings (re-read when the file changes)."""
+    path = vivaldi_prefs_path()
+    try:
+        mtime = os.path.getmtime(path)
+        if mtime != _prefs_cache['mtime']:
+            with open(path) as f:
+                _prefs_cache['data'] = json.load(f)
+            _prefs_cache['mtime'] = mtime
+    except (TypeError, OSError, ValueError):
+        pass
+    return _prefs_cache['data']
+
+
+def pref(path, default=None):
+    node = vivaldi_prefs()
+    for key in path.split('.'):
+        if not isinstance(node, dict) or key not in node:
+            return default
+        node = node[key]
+    return node
+
+
+# Checkmark state for View items, from Vivaldi's settings (key names and
+# defaults from Vivaldi's prefs_definitions.json). Vivaldi saves a change to
+# its settings file a moment after it happens.
+CHECKS = {
+    'tabbar': lambda: pref('vivaldi.tabs.visible', True) is not False,
+    'addressbar': lambda: pref('vivaldi.address_bar.visible', True) is not False,
+    'bookmarksbar': lambda: pref('vivaldi.bookmarks.bar.visible', False) is True,
+    'statusbar': lambda: pref('vivaldi.status_bar.display', 0) != 2,  # 2 = off
+    'panel': lambda: pref('vivaldi.panels.window_defaults.barVisible', True) is not False,
+}
+
+
+# Vivaldi batches settings writes (up to ~10 s), so after the user toggles
+# something from our menu, show the flipped state until the file catches up.
+_check_overrides = {}  # check name -> (value, time of the click)
+
+
+def check_state(name):
+    override = _check_overrides.get(name)
+    if override:
+        value, clicked = override
+        path = vivaldi_prefs_path()
+        try:
+            saved_since = os.path.getmtime(path) > clicked + 0.2
+        except (TypeError, OSError):
+            saved_since = False
+        if not saved_since and time.time() - clicked < 30:
+            return value
+        del _check_overrides[name]
+    return CHECKS[name]()
+
+
+def note_toggle(name):
+    _check_overrides[name] = (not check_state(name), time.time())
+
+
+def bind_vivaldi_shortcuts():
+    """Write VIVALDI_BINDINGS into Vivaldi's settings. Vivaldi must be closed."""
+    path = vivaldi_prefs_path()
+    if not path:
+        sys.exit('Vivaldi settings not found')
+    # Match the browser's own command line from its start (an unanchored
+    # pattern would also match whatever shell is running this).
+    running = subprocess.run(['pgrep', '-f', r'^(/snap/vivaldi/[0-9]+)?/opt/vivaldi/vivaldi'],
+                             stdout=subprocess.DEVNULL).returncode == 0
+    if running:
+        sys.exit('Quit Vivaldi first (Ctrl+Q): it rewrites its settings while running.')
+    with open(path) as f:
+        data = json.load(f)
+    actions = data.setdefault('vivaldi', {}).setdefault('actions', [{}])
+    if not actions:
+        actions.append({})
+    for command, key in VIVALDI_BINDINGS.items():
+        entry = actions[0].setdefault(command, {'shortcuts': []})
+        shortcuts = entry.setdefault('shortcuts', [])
+        if key not in shortcuts:
+            shortcuts.append(key)
+    if not os.path.exists(path + '.before-mac-menu'):  # keep the original
+        shutil.copy2(path, path + '.before-mac-menu')
+    with open(path, 'w') as f:
+        json.dump(data, f, separators=(',', ':'))
+    print(f'Bound {len(VIVALDI_BINDINGS)} Vivaldi commands (backup: {path}.before-mac-menu)')
+
+
+SEP = {'separator': True}
+MENUS = [
+    ('File', [
+        item('New Tab', 'newTab', 'ctrl+t'),
+        item('New Window', 'newWindow', 'ctrl+n'),
+        item('New Private Window', 'newPrivateWindow', 'ctrl+shift+n'),
+        SEP,
+        item('Open File…', keys='ctrl+o'),
+        item('Open Location…', keys='ctrl+l'),
+        SEP,
+        item('Close Tab', 'closeTab', 'ctrl+w'),
+        item('Close Window', 'closeWindow', 'ctrl+shift+w'),
+        SEP,
+        item('Save Page As…', keys='ctrl+s'),
+        item('Print…', keys='ctrl+p'),
+        SEP,
+        item('Quit Vivaldi', keys='ctrl+q'),
+    ]),
+    ('Edit', [
+        item('Undo', keys='ctrl+z'),
+        item('Redo', keys='ctrl+shift+z'),
+        SEP,
+        item('Cut', keys='ctrl+x'),
+        item('Copy', keys='ctrl+c'),
+        item('Paste', keys='ctrl+v'),
+        item('Paste and Match Style', keys='ctrl+shift+v'),
+        item('Select All', keys='ctrl+a'),
+        SEP,
+        item('Find…', keys='ctrl+f'),
+        SEP,
+        item('Settings…', 'openUrl', 'ctrl+f12', {'url': 'vivaldi://settings'}),
+    ]),
+    ('View', [
+        item('Show Tab Bar', keys=binding('COMMAND_MAIN_TOGGLE_TAB_BAR'), check='tabbar', hidden=True),
+        item('Show Address Bar', keys=binding('COMMAND_MAIN_TOGGLE_ADDRESS_BAR'), check='addressbar', hidden=True),
+        item('Show Bookmarks Bar', keys='ctrl+shift+b', check='bookmarksbar'),
+        item('Show Status Bar', keys='ctrl+shift+s', check='statusbar'),
+        item('Show Panel', keys='f4', check='panel'),
+        SEP,
+        {'submenu': 'Panels', 'items': [item(name, keys=binding(cmd), hidden=True) for name, cmd in PANELS]},
+        {'submenu': 'Web Panels', 'dynamic': 'webPanels'},
+        SEP,
+        {'submenu': 'Images and Animations', 'items': [
+            item('Always Show Images', keys=binding('COMMAND_SET_LOAD_IMAGES_ALWAYS'), hidden=True),
+            item('Show Images from Cache', keys=binding('COMMAND_SET_LOAD_IMAGES_CACHE'), hidden=True),
+            item("Don't Show Images", keys=binding('COMMAND_SET_LOAD_IMAGES_NEVER'), hidden=True),
+        ]},
+        SEP,
+        item('Reload Page', 'reload', 'ctrl+r'),
+        item('Force Reload', 'hardReload', 'ctrl+shift+r'),
+        SEP,
+        item('Page Zoom In', 'zoomIn', 'ctrl+equal'),
+        item('Page Zoom Out', 'zoomOut', 'ctrl+minus'),
+        item('Page Zoom Reset', 'zoomReset', 'ctrl+0'),
+        SEP,
+        item('Enter Full Screen', keys='f11'),
+        SEP,
+        item('Developer Tools', keys='ctrl+shift+i'),
+        item('View Source', keys='ctrl+u'),
+        SEP,
+        item('Customize Toolbars', keys=binding('COMMAND_CUSTOMIZE_TOOLBAR'), hidden=True),
+    ]),
+    ('History', [
+        item('Back', 'back', 'alt+left'),
+        item('Forward', 'forward', 'alt+right'),
+        SEP,
+        item('Reopen Closed Tab', 'reopenClosed', 'ctrl+shift+t'),
+        {'submenu': 'Recently Closed', 'dynamic': 'recentlyClosed'},
+        SEP,
+        {'section': 'Recently Visited'},
+        {'dynamic': 'history'},
+        SEP,
+        item('Show All History', keys='ctrl+h'),
+    ]),
+    ('Bookmarks', [
+        item('Bookmark This Page…', keys='ctrl+d'),
+        item('Show All Bookmarks', 'openUrl', 'ctrl+b', {'url': 'vivaldi://bookmarks'}),
+        SEP,
+        {'dynamic': 'bookmarks'},
+    ]),
+    ('Window', [
+        item('Minimize', keys='meta+pagedown'),
+        item('Zoom', keys='meta+pageup'),
+        SEP,
+        item('Show Next Tab', 'nextTab', 'ctrl+tab'),
+        item('Show Previous Tab', 'previousTab', 'ctrl+shift+tab'),
+        item('Duplicate Tab', 'duplicateTab'),
+        item('Pin Tab', 'togglePin'),
+        item('Mute Tab', 'toggleMute'),
+        SEP,
+        {'dynamic': 'tabs'},
+        SEP,
+        item('Downloads', keys='ctrl+j'),
+        item('Extensions', 'openUrl', args={'url': 'vivaldi://extensions'}),
+    ]),
+    ('Help', [
+        item('Vivaldi Help', 'openUrl', 'f1', {'url': 'https://help.vivaldi.com'}),
+        item('Keyboard Shortcuts', keys='ctrl+f1'),
+        SEP,
+        item('About Vivaldi', 'openUrl', args={'url': 'vivaldi://about'}),
+    ]),
+]
+DYNAMIC = ('history', 'recentlyClosed', 'bookmarks', 'tabs')
+
+# Shortcut tokens as dbusmenu expects them (Qt key names).
+SHORTCUT_NAMES = {'ctrl': 'Control', 'shift': 'Shift', 'alt': 'Alt', 'meta': 'Super', 'equal': '+',
+                  'minus': '-', 'left': 'Left', 'right': 'Right', 'tab': 'Tab', 'pageup': 'PgUp',
+                  'pagedown': 'PgDown', 'esc': 'Esc'}
+
+MENU_PATH = '/MenuBar'
+DBUSMENU_XML = """
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <property name="Version" type="u" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
+    <method name="GetLayout">
+      <arg type="i" name="parentId" direction="in"/><arg type="i" name="recursionDepth" direction="in"/>
+      <arg type="as" name="propertyNames" direction="in"/>
+      <arg type="u" name="revision" direction="out"/><arg type="(ia{sv}av)" name="layout" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg type="ai" name="ids" direction="in"/><arg type="as" name="propertyNames" direction="in"/>
+      <arg type="a(ia{sv})" name="properties" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg type="i" name="id" direction="in"/><arg type="s" name="name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg type="i" name="id" direction="in"/><arg type="s" name="eventId" direction="in"/>
+      <arg type="v" name="data" direction="in"/><arg type="u" name="timestamp" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg type="a(isvu)" name="events" direction="in"/><arg type="ai" name="idErrors" direction="out"/>
+    </method>
+    <method name="AboutToShow">
+      <arg type="i" name="id" direction="in"/><arg type="b" name="needUpdate" direction="out"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg type="ai" name="ids" direction="in"/>
+      <arg type="ai" name="updatesNeeded" direction="out"/><arg type="ai" name="idErrors" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg type="a(ia{sv})" name="updatedProps"/><arg type="a(ias)" name="removedProps"/>
+    </signal>
+    <signal name="LayoutUpdated"><arg type="u" name="revision"/><arg type="i" name="parent"/></signal>
+    <signal name="ItemActivationRequested"><arg type="i" name="id"/><arg type="u" name="timestamp"/></signal>
+  </interface>
+</node>"""
+
+
+def shortcut(keys):
+    if not keys:
+        return None
+    return [[SHORTCUT_NAMES.get(k, k.upper()) for k in keys.split('+')]]
+
+
+def menu_label(text, limit=60):
+    # Underscores mark mnemonics in dbusmenu; double them to show literally.
+    text = (text or '').replace('\n', ' ')
+    if len(text) > limit:
+        text = text[:limit - 1] + '…'
+    return text.replace('_', '__')
+
+
+class GlobalMenu:
+    """Serves MENUS over com.canonical.dbusmenu for KDE's global menu."""
+
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.connection = None
+        self.revision = 1
+        self.nodes = {0: {'props': {'children-display': 'submenu'}, 'children': []}}
+        self.next_id = 1
+        self.cache = {name: None for name in DYNAMIC}
+        self.top = {}  # top-level menu id -> its MENUS entries
+        for title, entries in MENUS:
+            mid = self.add(0, {'label': title, 'children-display': 'submenu'})
+            self.top[mid] = entries
+        self.rebuild_all()
+
+    # -- tree building --
+    def add(self, parent, props, action=None):
+        nid = self.next_id
+        self.next_id += 1
+        self.nodes[nid] = {'props': props, 'children': [], 'action': action}
+        self.nodes[parent]['children'].append(nid)
+        return nid
+
+    def clear(self, nid):
+        for child in self.nodes[nid]['children']:
+            self.clear(child)
+            del self.nodes[child]
+        self.nodes[nid]['children'] = []
+
+    def add_entry(self, parent, entry):
+        connected = self.bridge.client is not None
+        props = {'label': menu_label(entry['label']),
+                 'enabled': bool(entry.get('keys') or connected)}
+        sc = None if entry.get('hidden') else shortcut(entry.get('keys'))
+        if sc:
+            props['shortcut'] = sc
+        if entry.get('check'):
+            props['toggle-type'] = 'checkmark'
+            props['toggle-state'] = 1 if check_state(entry['check']) else 0
+
+        def run(e=entry):
+            if e.get('check'):
+                note_toggle(e['check'])
+            self.bridge.command(e.get('cmd'), e.get('args'), e.get('keys'))
+
+        self.add(parent, props, run)
+
+    def add_link(self, parent, title, cmd, args):
+        self.add(parent, {'label': menu_label(title)}, lambda: self.bridge.command(cmd, args))
+
+    def add_placeholder(self, parent):
+        text = 'Nothing here yet' if self.bridge.client else 'Connect the Mac Menu Bridge extension'
+        self.add(parent, {'label': text, 'enabled': False})
+
+    def add_dynamic(self, parent, name):
+        if name == 'webPanels':
+            panels = pref('vivaldi.panels.web.elements', []) or []
+            for i, panel in enumerate(panels[:len(WEB_PANEL_KEYS)], start=1):
+                title = panel.get('title') or panel.get('url') or f'Web Panel {i}'
+                self.add_entry(parent, item(title, keys=binding(f'COMMAND_SHOW_WEB_PANEL_{i}'), hidden=True))
+            if panels:
+                self.add(parent, {'type': 'separator'})
+            self.add_entry(parent, item('Add Current Page as Web Panel', keys=binding('COMMAND_ADD_TO_WEB_PANEL'), hidden=True))
+            return
+        data = self.cache.get(name)
+        if not data:
+            self.add_placeholder(parent)
+        elif name == 'history':
+            for page in data:
+                self.add_link(parent, page.get('title'), 'openUrl', {'url': page.get('url')})
+        elif name == 'recentlyClosed':
+            for entry in data:
+                self.add_link(parent, entry.get('title'), 'restoreSession', {'sessionId': entry.get('sessionId')})
+        elif name == 'tabs':
+            for tab in data:
+                self.add(parent, {'label': menu_label(('🔊 ' if tab.get('audible') else '') + (tab.get('title') or '')),
+                                        'toggle-type': 'radio', 'toggle-state': 1 if tab.get('active') else 0},
+                               lambda t=tab: self.bridge.command('activateTab', {'tabId': t.get('id')}))
+        elif name == 'bookmarks':
+            # The first root is the bookmarks bar, shown inline; other roots as submenus.
+            for i, root in enumerate(data):
+                if i == 0:
+                    self.add_bookmarks(parent, root.get('children') or [], 0)
+                elif root.get('children'):
+                    sub = self.add(parent, {'label': menu_label(root.get('title')), 'children-display': 'submenu'})
+                    self.add_bookmarks(sub, root['children'], 1)
+
+    def add_bookmarks(self, parent, nodes, depth):
+        for node in nodes:
+            if node.get('url'):
+                self.add_link(parent, node.get('title'), 'openUrl', {'url': node['url']})
+            elif node.get('children') and depth < 6:
+                sub = self.add(parent, {'label': menu_label(node.get('title') or 'Folder'), 'children-display': 'submenu'})
+                self.add_bookmarks(sub, node['children'], depth + 1)
+
+    def fill(self, mid):
+        self.clear(mid)
+        for entry in self.top[mid]:
+            if entry.get('separator'):
+                self.add(mid, {'type': 'separator'})
+            elif entry.get('section'):
+                self.add(mid, {'label': menu_label(entry['section']), 'enabled': False})
+            elif entry.get('submenu'):
+                sub = self.add(mid, {'label': menu_label(entry['submenu']), 'children-display': 'submenu'})
+                if 'items' in entry:
+                    for child in entry['items']:
+                        self.add_entry(sub, child)
+                else:
+                    self.add_dynamic(sub, entry['dynamic'])
+            elif entry.get('dynamic'):
+                self.add_dynamic(mid, entry['dynamic'])
+            else:
+                self.add_entry(mid, entry)
+
+    def rebuild_all(self):
+        for mid in self.top:
+            self.fill(mid)
+
+    def dynamic_names(self, mid):
+        return [e['dynamic'] for e in self.top.get(mid, []) if e.get('dynamic') and e['dynamic'] in DYNAMIC]
+
+    def uses_prefs(self, mid):
+        return any(e.get('check') or e.get('dynamic') == 'webPanels' for e in self.top.get(mid, []))
+
+    # -- updates --
+    def emit_layout(self, parent):
+        self.revision += 1
+        if self.connection:
+            self.connection.emit_signal(None, MENU_PATH, 'com.canonical.dbusmenu', 'LayoutUpdated',
+                                        GLib.Variant('(ui)', (self.revision, parent)))
+
+    def relayout(self):
+        """Rebuild everything (e.g. after the extension connects) and refresh."""
+        self.rebuild_all()
+        self.emit_layout(0)
+        self.refresh_all()
+
+    def refresh(self, mid):
+        """Re-query a top-level menu's dynamic content, then update it."""
+        if self.uses_prefs(mid):
+            self.fill(mid)
+            self.emit_layout(mid)
+        names = self.dynamic_names(mid)
+        if not names or self.bridge.client is None:
+            return
+        remaining = set(names)
+
+        def got(name, data):
+            self.cache[name] = data
+            remaining.discard(name)
+            if not remaining and mid in self.nodes:
+                self.fill(mid)
+                self.emit_layout(mid)
+
+        for name in names:
+            self.bridge.query(name, lambda data, n=name: got(n, data))
+
+    def refresh_all(self):
+        for mid in self.top:
+            self.refresh(mid)
+        return True  # keep the periodic timer running
+
+    # -- D-Bus --
+    def props_variant(self, nid, names=None):
+        out = {}
+        for key, value in self.nodes[nid]['props'].items():
+            if names and key not in names:
+                continue
+            if isinstance(value, bool):
+                out[key] = GLib.Variant('b', value)
+            elif isinstance(value, int):
+                out[key] = GLib.Variant('i', value)
+            elif isinstance(value, list):
+                out[key] = GLib.Variant('aas', value)
+            else:
+                out[key] = GLib.Variant('s', value)
+        return out
+
+    def layout(self, nid, depth, names):
+        children = []
+        if depth != 0:
+            for child in self.nodes[nid]['children']:
+                children.append(GLib.Variant('(ia{sv}av)', self.layout(child, depth - 1, names)))
+        return (nid, self.props_variant(nid, names), children)
+
+    def on_call(self, connection, sender, path, iface, method, params, invocation):
+        args = params.unpack()
+        if method == 'GetLayout':
+            parent, depth, names = args
+            if parent not in self.nodes:
+                invocation.return_dbus_error('com.canonical.dbusmenu.Error', 'no such item')
+                return
+            invocation.return_value(GLib.Variant('(u(ia{sv}av))', (self.revision, self.layout(parent, depth, names))))
+        elif method == 'GetGroupProperties':
+            ids, names = args
+            ids = ids or list(self.nodes)
+            result = [(i, self.props_variant(i, names)) for i in ids if i in self.nodes]
+            invocation.return_value(GLib.Variant('(a(ia{sv}))', (result,)))
+        elif method == 'GetProperty':
+            nid, name = args
+            value = self.props_variant(nid).get(name) if nid in self.nodes else None
+            if value is None:
+                invocation.return_dbus_error('com.canonical.dbusmenu.Error', 'no such property')
+            else:
+                invocation.return_value(GLib.Variant('(v)', (value,)))
+        elif method == 'Event':
+            nid, event_id, _data, _ts = args
+            invocation.return_value(None)
+            self.activate(nid, event_id)
+        elif method == 'EventGroup':
+            errors = []
+            for nid, event_id, _data, _ts in args[0]:
+                if nid in self.nodes:
+                    self.activate(nid, event_id)
+                else:
+                    errors.append(nid)
+            invocation.return_value(GLib.Variant('(ai)', (errors,)))
+        elif method == 'AboutToShow':
+            # Answer right away with what's cached; fresh items follow via LayoutUpdated.
+            (nid,) = args
+            invocation.return_value(GLib.Variant('(b)', (False,)))
+            if nid in self.top:
+                self.refresh(nid)
+        elif method == 'AboutToShowGroup':
+            for nid in args[0]:
+                if nid in self.top:
+                    self.refresh(nid)
+            invocation.return_value(GLib.Variant('(aiai)', ([], [])))
+
+    def activate(self, nid, event_id):
+        node = self.nodes.get(nid)
+        if event_id == 'clicked' and node and node.get('action'):
+            node['action']()
+
+    def get_property(self, connection, sender, path, iface, name):
+        return {'Version': GLib.Variant('u', 3), 'TextDirection': GLib.Variant('s', 'ltr'),
+                'Status': GLib.Variant('s', 'normal'), 'IconThemePath': GLib.Variant('as', [])}.get(name)
+
+    def register(self, connection):
+        self.connection = connection
+        node = Gio.DBusNodeInfo.new_for_xml(DBUSMENU_XML)
+        connection.register_object(MENU_PATH, node.interfaces[0], self.on_call, self.get_property, None)
+        # Keep history, tabs and bookmarks reasonably fresh even before a menu opens.
+        GLib.timeout_add_seconds(15, self.refresh_all)
+
+
+# ---- Attaching the menu to Vivaldi's windows (X11 / XWayland) --------------
+class X11Tagger:
+    """Marks Vivaldi's X11 windows with this menu's D-Bus address.
+
+    KWin reads _KDE_NET_WM_APPMENU_SERVICE_NAME/_OBJECT_PATH from X11 windows
+    and the global menu widget then shows our menu for them. (On native
+    Wayland only the app itself can do this, hence XWayland.)"""
+
+    def __init__(self, service, path):
+        import ctypes
+        self.ct = ctypes
+        self.service = service.encode()
+        self.path = path.encode()
+        self.tagged = set()
+        self.requests = []          # (window, service, path) from the registrar
+        self.requests_lock = threading.Lock()
+        x = ctypes.CDLL('libX11.so.6')
+        x.XOpenDisplay.restype = ctypes.c_void_p
+        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x.XDefaultRootWindow.restype = ctypes.c_ulong
+        x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x.XInternAtom.restype = ctypes.c_ulong
+        x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x.XGetWindowProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long,
+                                         ctypes.c_int, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                                         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong),
+                                         ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p)]
+        x.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        x.XFree.argtypes = [ctypes.c_void_p]
+        x.XFlush.argtypes = [ctypes.c_void_p]
+        x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        # Windows can vanish between listing and tagging; ignore X errors
+        # instead of letting Xlib exit the process.
+        self.handler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)(lambda d, e: 0)
+        x.XSetErrorHandler(self.handler)
+        self.x = x
+
+    def get(self, display, window, atom, kind):
+        ct = self.ct
+        actual, fmt, n, after, data = ct.c_ulong(), ct.c_int(), ct.c_ulong(), ct.c_ulong(), ct.c_void_p()
+        if self.x.XGetWindowProperty(display, window, atom, 0, 65536, 0, kind, ct.byref(actual), ct.byref(fmt),
+                                     ct.byref(n), ct.byref(after), ct.byref(data)) != 0 or not data.value:
+            return None
+        try:
+            if fmt.value == 32:  # stored as C longs
+                return list((ct.c_ulong * n.value).from_address(data.value))
+            return ct.string_at(data.value, n.value)
+        finally:
+            self.x.XFree(data)
+
+    def run(self):
+        display = None
+        while True:
+            try:
+                if not display:
+                    display = self.x.XOpenDisplay(None)
+                if display:
+                    self.scan(display)
+            except Exception:
+                display = None
+            time.sleep(0.5)
+
+    def request(self, window, service, path):
+        """Tag `window` with an app's own menu (called from other threads)."""
+        with self.requests_lock:
+            self.requests.append((window, service.encode(), path.encode()))
+
+    def scan(self, display):
+        x = self.x
+        with self.requests_lock:
+            requests, self.requests = self.requests, []
+        for window, service, path in requests:
+            x.XChangeProperty(display, window, x.XInternAtom(display, b'_KDE_NET_WM_APPMENU_SERVICE_NAME', 0),
+                              31, 8, 0, service, len(service))
+            x.XChangeProperty(display, window, x.XInternAtom(display, b'_KDE_NET_WM_APPMENU_OBJECT_PATH', 0),
+                              31, 8, 0, path, len(path))
+        root = x.XDefaultRootWindow(display)
+        client_list = x.XInternAtom(display, b'_NET_CLIENT_LIST', 0)
+        service_atom = x.XInternAtom(display, b'_KDE_NET_WM_APPMENU_SERVICE_NAME', 0)
+        path_atom = x.XInternAtom(display, b'_KDE_NET_WM_APPMENU_OBJECT_PATH', 0)
+        windows = self.get(display, root, client_list, 33) or []  # XA_WINDOW
+        alive = set(windows)
+        self.tagged &= alive
+        for window in windows:
+            if window in self.tagged:
+                continue
+            wm_class = self.get(display, window, 67, 31) or b''  # XA_WM_CLASS, XA_STRING
+            if b'vivaldi' not in wm_class.lower():
+                continue
+            x.XChangeProperty(display, window, service_atom, 31, 8, 0, self.service, len(self.service))
+            x.XChangeProperty(display, window, path_atom, 31, 8, 0, self.path, len(self.path))
+            self.tagged.add(window)
+        x.XFlush(display)
+
+
+# ---- Menu proxy for the Menu Bar widget -----------------------------------
+# QML can't decode nested dbusmenu layouts, so the widget asks us for an app's
+# menu as JSON and asks us to click items.
+PROXY_PATH = '/MenuProxy'
+PROXY_XML = """
+<node>
+  <interface name="org.brhett.MenuProxy">
+    <method name="GetMenu">
+      <arg type="s" name="service" direction="in"/><arg type="s" name="path" direction="in"/>
+      <arg type="s" name="json" direction="out"/>
+    </method>
+    <method name="Refresh">
+      <arg type="s" name="service" direction="in"/><arg type="s" name="path" direction="in"/>
+      <arg type="i" name="id" direction="in"/><arg type="s" name="json" direction="out"/>
+    </method>
+    <method name="Activate">
+      <arg type="s" name="service" direction="in"/><arg type="s" name="path" direction="in"/>
+      <arg type="i" name="id" direction="in"/>
+    </method>
+  </interface>
+</node>"""
+SHORTCUT_TOKENS = {'Control': 'Ctrl', 'Super': 'Meta'}
+
+
+def clean_label(label):
+    """Remove dbusmenu mnemonics: '_File' -> 'File', '__' -> '_'."""
+    return label.replace('__', '\0').replace('_', '').replace('\0', '_')
+
+
+def to_json_node(nid, props, children):
+    node = {'id': nid, 'label': clean_label(props.get('label', '')), 'enabled': props.get('enabled', True),
+            'visible': props.get('visible', True), 'separator': props.get('type') == 'separator'}
+    sc = props.get('shortcut')
+    if sc:
+        node['shortcut'] = '+'.join(SHORTCUT_TOKENS.get(t, t) for t in sc[0])
+    if props.get('toggle-type') in ('checkmark', 'radio'):
+        node['toggle'] = props['toggle-type']
+        node['checked'] = props.get('toggle-state', 0) == 1
+    if props.get('children-display') == 'submenu' or children:
+        node['children'] = [to_json_node(*child) for child in children]
+    return node
+
+
+class MenuProxy:
+    def __init__(self, bridge, bus):
+        self.bridge = bridge
+        self.bus = bus
+
+    def local_layout(self, nid):
+        menu = self.bridge.menu
+        props = dict(menu.nodes[nid]['props'])
+        return (nid, props, [self.local_layout(c) for c in menu.nodes[nid]['children']])
+
+    def remote(self, service, path, method, args, reply):
+        return self.bus.call_sync(service, path, 'com.canonical.dbusmenu', method, args,
+                                  GLib.VariantType(reply) if reply else None, Gio.DBusCallFlags.NONE, 1500, None)
+
+    def layout(self, service, path, nid, prepare):
+        """Menu tree under `nid` as JSON-ready dicts."""
+        if service == BUS_NAME:
+            # Our own Vivaldi menu: read it directly (a D-Bus call to
+            # ourselves from this thread would deadlock). Refresh it on the
+            # main loop first, like AboutToShow would (checkmarks etc.).
+            menu = self.bridge.menu
+            if prepare and nid in menu.top:
+                done = threading.Event()
+
+                def refresh():
+                    menu.refresh(nid)
+                    done.set()
+                    return False
+
+                GLib.idle_add(refresh)
+                done.wait(0.5)
+            return to_json_node(*self.local_layout(nid))
+        if prepare:
+            # Let apps fill lazily-built submenus before we read them.
+            try:
+                _rev, top = self.remote(service, path, 'GetLayout', GLib.Variant('(iias)', (nid, 1, [])),
+                                        '(u(ia{sv}av))').unpack()
+                for child in [nid] + [c[0] for c in top[2]]:
+                    try:
+                        self.remote(service, path, 'AboutToShow', GLib.Variant('(i)', (child,)), '(b)')
+                    except GLib.Error:
+                        pass
+            except GLib.Error:
+                pass
+        _rev, tree = self.remote(service, path, 'GetLayout', GLib.Variant('(iias)', (nid, -1, [])),
+                                 '(u(ia{sv}av))').unpack()
+        return to_json_node(*tree)
+
+    def on_call(self, connection, sender, path, iface, method, params, invocation):
+        args = params.unpack()
+
+        def work():
+            try:
+                if method == 'GetMenu':
+                    result = json.dumps(self.layout(args[0], args[1], 0, True))
+                elif method == 'Refresh':
+                    result = json.dumps(self.layout(args[0], args[1], args[2], True))
+                else:  # Activate
+                    if args[0] == BUS_NAME:
+                        GLib.idle_add(lambda: self.bridge.menu.activate(args[2], 'clicked') and False)
+                    else:
+                        self.remote(args[0], args[1], 'Event',
+                                    GLib.Variant('(isvu)', (args[2], 'clicked', GLib.Variant('i', 0), 0)), None)
+                    result = None
+            except GLib.Error:
+                result = 'null' if method != 'Activate' else None
+            if result is None:
+                GLib.idle_add(lambda: invocation.return_value(None) and False)
+            else:
+                GLib.idle_add(lambda: invocation.return_value(GLib.Variant('(s)', (result,))) and False)
+
+        # Apps can be slow to answer; don't block the main loop.
+        threading.Thread(target=work, daemon=True).start()
+
+    def register(self, connection):
+        node = Gio.DBusNodeInfo.new_for_xml(PROXY_XML)
+        connection.register_object(PROXY_PATH, node.interfaces[0], self.on_call, None, None)
+
+
+# ---- Menu registrar (com.canonical.AppMenu.Registrar) ---------------------
+# Apps only publish their menus while this service exists. KDE's appmenu
+# module provides it only when the stock Global Menu widget is in the panel
+# layout, and the Menu Bar widget replaces that widget, so we provide it
+# ourselves. If KDE's registrar starts later it may take the name over.
+REGISTRAR_NAME = 'com.canonical.AppMenu.Registrar'
+REGISTRAR_PATH = '/com/canonical/AppMenu/Registrar'
+REGISTRAR_XML = """
+<node>
+  <interface name="com.canonical.AppMenu.Registrar">
+    <method name="RegisterWindow">
+      <arg type="u" name="windowId" direction="in"/><arg type="o" name="menuObjectPath" direction="in"/>
+    </method>
+    <method name="UnregisterWindow"><arg type="u" name="windowId" direction="in"/></method>
+    <method name="GetMenuForWindow">
+      <arg type="u" name="windowId" direction="in"/>
+      <arg type="s" name="service" direction="out"/><arg type="o" name="menuObjectPath" direction="out"/>
+    </method>
+  </interface>
+</node>"""
+
+
+class Registrar:
+    def __init__(self, tagger):
+        self.tagger = tagger
+        self.windows = {}  # X11 window id -> (service, path)
+
+    def on_call(self, connection, sender, path, iface, method, params, invocation):
+        args = params.unpack()
+        if method == 'RegisterWindow':
+            window, menu_path = args
+            self.windows[window] = (sender, menu_path)
+            # X11 windows: label them so KWin (and the menu bar) find the menu.
+            self.tagger.request(window, sender, menu_path)
+            invocation.return_value(None)
+        elif method == 'UnregisterWindow':
+            self.windows.pop(args[0], None)
+            invocation.return_value(None)
+        elif method == 'GetMenuForWindow':
+            service, menu_path = self.windows.get(args[0], ('', '/'))
+            invocation.return_value(GLib.Variant('(so)', (service, menu_path)))
+
+    def register(self, connection):
+        node = Gio.DBusNodeInfo.new_for_xml(REGISTRAR_XML)
+        connection.register_object(REGISTRAR_PATH, node.interfaces[0], self.on_call, None, None)
+        # Queue for the name if KDE already owns it; let KDE replace us.
+        Gio.bus_own_name_on_connection(connection, REGISTRAR_NAME, Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT,
+                                       None, None)
+
+
+class Bridge:
+    def __init__(self):
+        self.cfg = load_config()
+        self.client = None
+        self.pending = {}  # query id -> callback(data)
+        self.next_id = 1
+        self.menu = None
+
+    # -- WebSocket side (worker threads) --
+    def serve(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', self.cfg['port']))
+        srv.listen(4)
+        while True:
+            conn, _ = srv.accept()
+            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+
+    def handshake(self, conn):
+        conn.settimeout(5)
+        data = b''
+        while b'\r\n\r\n' not in data:
+            chunk = conn.recv(4096)
+            if not chunk or len(data) > 16384:
+                return False
+            data += chunk
+        headers = {}
+        for line in data.decode(errors='replace').split('\r\n')[1:]:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip().lower()] = v.strip()
+        # Only browser extensions may connect; web pages have http(s) origins.
+        origin = headers.get('origin', '')
+        if not origin.startswith('chrome-extension://') or 'sec-websocket-key' not in headers:
+            conn.sendall(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n')
+            return False
+        accept = base64.b64encode(hashlib.sha1((headers['sec-websocket-key'] + WS_GUID).encode()).digest()).decode()
+        conn.sendall(('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                      f'Sec-WebSocket-Accept: {accept}\r\n\r\n').encode())
+        conn.settimeout(None)
+        return True
+
+    def handle(self, conn):
+        client = None
+        try:
+            if not self.handshake(conn):
+                return
+            client = Client(conn)
+            hello = json.loads(client.recv() or '{}')
+            if hello.get('type') != 'hello' or not secrets.compare_digest(str(hello.get('token', '')), self.cfg['token']):
+                return
+            self.client = client
+            GLib.idle_add(self.connection_changed)
+            while True:
+                text = client.recv()
+                if text is None:
+                    break
+                msg = json.loads(text)
+                if msg.get('type') == 'result':
+                    GLib.idle_add(self.finish_query, msg.get('id'), msg.get('data'))
+        except (ConnectionError, OSError, ValueError):
+            pass
+        finally:
+            if client is not None and self.client is client:
+                self.client = None
+                GLib.idle_add(self.connection_changed)
+            conn.close()
+
+    def keepalive(self):
+        # Activity keeps the extension's service worker from being suspended.
+        while True:
+            time.sleep(20)
+            client = self.client
+            if client:
+                try:
+                    client.send({'type': 'ping'})
+                except OSError:
+                    pass
+
+    # -- D-Bus side (GLib main loop) --
+    def on_call(self, connection, sender, path, iface, method, params, invocation):
+        if method == 'Connected':
+            invocation.return_value(GLib.Variant('(b)', (self.client is not None,)))
+        elif method == 'Command':
+            name, args = params.unpack()
+            invocation.return_value(None)
+            if name == 'keys':
+                threading.Thread(target=press, args=(json.loads(args or '""'),), daemon=True).start()
+            elif self.client:
+                try:
+                    self.client.send({'type': 'cmd', 'name': name, 'args': json.loads(args or 'null')})
+                except (OSError, ValueError):
+                    pass
+        elif method == 'Query':
+            (what,) = params.unpack()
+            self.query(what, lambda data: invocation.return_value(GLib.Variant('(s)', (json.dumps(data),))))
+
+    def query(self, what, callback):
+        """Ask the extension for `what`; callback(data) runs on the main loop
+        with the answer, or None if it isn't connected or doesn't reply."""
+        client = self.client
+        if not client:
+            callback(None)
+            return
+        qid = self.next_id
+        self.next_id += 1
+        self.pending[qid] = callback
+        GLib.timeout_add(int(QUERY_TIMEOUT * 1000), self.finish_query, qid, None)
+        try:
+            client.send({'type': 'query', 'id': qid, 'what': what})
+        except OSError:
+            self.finish_query(qid, None)
+
+    def finish_query(self, qid, data):
+        callback = self.pending.pop(qid, None)
+        if callback:
+            callback(data)
+        return False
+
+    def command(self, name, args=None, keys=None):
+        """Run a menu command through the extension, or type its shortcut."""
+        if name and self.client:
+            try:
+                self.client.send({'type': 'cmd', 'name': name, 'args': args or {}})
+                return
+            except OSError:
+                pass
+        if keys:
+            threading.Thread(target=press, args=(keys,), daemon=True).start()
+
+    def connection_changed(self):
+        if self.menu:
+            self.menu.relayout()
+        return False
+
+    def run(self):
+        threading.Thread(target=self.serve, daemon=True).start()
+        threading.Thread(target=self.keepalive, daemon=True).start()
+        node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+
+        def on_bus(connection, name):
+            connection.register_object(OBJECT_PATH, node.interfaces[0], self.on_call, None, None)
+            self.menu = GlobalMenu(self)
+            self.menu.register(connection)
+            MenuProxy(self, connection).register(connection)
+            tagger = X11Tagger(BUS_NAME, MENU_PATH)
+            threading.Thread(target=tagger.run, daemon=True).start()
+            Registrar(tagger).register(connection)
+
+        Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE, on_bus, None,
+                         lambda *a: os._exit(1))
+        GLib.MainLoop().run()
+
+
+if __name__ == '__main__':
+    import sys
+    if sys.argv[1:] == ['--bind-vivaldi']:
+        bind_vivaldi_shortcuts()
+    elif sys.argv[1:] == ['--config']:
+        # Used by install.sh to write the extension's matching config.js.
+        print(json.dumps(load_config()))
+    else:
+        Bridge().run()

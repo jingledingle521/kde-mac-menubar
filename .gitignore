@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Generated per install; holds the extension's private token.
+bridge/extension/config.js

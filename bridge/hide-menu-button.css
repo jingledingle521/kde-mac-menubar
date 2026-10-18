@@ -1,0 +1,5 @@
+/* The File/Edit/View… menus live in the KDE top bar (Mac Menu Bridge), so
+   hide Vivaldi's own menu button. Alt still opens Vivaldi's menu if needed. */
+button.vivaldi {
+  display: none !important;
+}

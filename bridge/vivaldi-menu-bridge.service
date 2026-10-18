@@ -1,0 +1,12 @@
+[Unit]
+Description=Global menu for Vivaldi (Mac Menu Bridge helper)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/vivaldi-menu-bridge
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,18 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Brhett"
+            }
+        ],
+        "Category": "Utilities",
+        "Description": "macOS-style menu bar: Apple menu, app menu and the focused app's menus in one strip",
+        "Icon": "application-menu",
+        "Id": "org.brhett.menubar",
+        "License": "GPL-2.0+",
+        "Name": "Menu Bar",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
