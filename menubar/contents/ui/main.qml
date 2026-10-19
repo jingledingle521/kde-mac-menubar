@@ -827,6 +827,8 @@ PlasmoidItem {
                     visible: !title.isApple
                     text: title.modelData.label || ""
                     font.weight: title.modelData.kind === "app" ? Font.Bold : Font.Normal
+                    // A point under the system font, for the slim (26 px) bar.
+                    font.pointSize: Kirigami.Theme.defaultFont.pointSize - 1
                     textFormat: Text.PlainText
                 }
             }
